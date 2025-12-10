@@ -25,6 +25,40 @@ import math
 import itertools
 import re
 
+def _unwrap_action(action_ref):
+    if action_ref is None:
+        return None
+    return action_ref.action if hasattr(action_ref, "action") else action_ref
+
+def _get_action_slot(anim_data):
+    if anim_data is None:
+        return None
+    if getattr(anim_data, "action_slot", None) is not None:
+        return anim_data.action_slot
+    slots = getattr(anim_data, "action_slots", None)
+    if slots is not None:
+        return getattr(slots, "active", None)
+    return None
+
+def _get_channelbag(action, anim_data=None, ensure=False):
+    if action is None:
+        return None
+    slot = _get_action_slot(anim_data) if anim_data else None
+    try:
+        if ensure and hasattr(bpy_extras.anim_utils, "action_ensure_channelbag_for_slot"):
+            return bpy_extras.anim_utils.action_ensure_channelbag_for_slot(action, slot)
+        if not ensure and hasattr(bpy_extras.anim_utils, "action_get_channelbag_for_slot"):
+            return bpy_extras.anim_utils.action_get_channelbag_for_slot(action, slot)
+    except Exception:
+        pass
+    return None
+
+def _get_action_fcurves(action_ref, anim_data=None):
+    action = _unwrap_action(action_ref)
+    channelbag = _get_channelbag(action, anim_data, ensure=True)
+    if channelbag and hasattr(channelbag, "fcurves"):
+        return channelbag.fcurves
+    return getattr(action, "fcurves", None)
 
 def cursor(cursor_mode):
     def cursor_decorator(func):
@@ -79,17 +113,37 @@ def find_wheelbrake_bone(bones, position, side, index):
 def clear_property_animation(context, property_name, remove_keyframes=True):
     if remove_keyframes and context.object.animation_data and context.object.animation_data.action:
         fcurve_datapath = '["%s"]' % property_name
-        action = context.object.animation_data.action
-        fcurve = action.fcurves.find(fcurve_datapath)
-        if fcurve is not None:
-            action.fcurves.remove(fcurve)
+        action = _unwrap_action(context.object.animation_data.action)
+        channelbag = _get_channelbag(action, context.object.animation_data, ensure=False)
+        if channelbag and hasattr(channelbag, "fcurves"):
+            fcurve = channelbag.fcurves.find(fcurve_datapath, index=0)
+            if fcurve is not None:
+                channelbag.fcurves.remove(fcurve)
+        else:
+            fcurves = _get_action_fcurves(context.object.animation_data.action, context.object.animation_data)
+            if fcurves is not None:
+                fcurve = fcurves.find(fcurve_datapath)
+                if fcurve is not None:
+                    fcurves.remove(fcurve)
     context.object[property_name] = .0
 
 
 def create_property_animation(context, property_name):
-    action = context.object.animation_data.action
+    if context.object.animation_data is None:
+        context.object.animation_data_create()
+    anim_data = context.object.animation_data
+    if anim_data.action is None:
+        anim_data.action = bpy.data.actions.new("%sAction" % context.object.name)
+    action = _unwrap_action(anim_data.action)
+    channelbag = _get_channelbag(action, anim_data, ensure=True)
     fcurve_datapath = '["%s"]' % property_name
-    return action.fcurves.new(fcurve_datapath, index=0, action_group='Wheels rotation')
+    if channelbag and hasattr(channelbag, "fcurves"):
+        return channelbag.fcurves.ensure(data_path=fcurve_datapath, index=0, group_name='Wheels rotation')
+    fcurves = _get_action_fcurves(anim_data.action, anim_data)
+    if fcurves:
+        existing = fcurves.find(fcurve_datapath)
+        return existing or fcurves.new(fcurve_datapath, index=0, action_group='Wheels rotation')
+    return None
 
 
 class FCurvesEvaluator(object):
@@ -190,8 +244,15 @@ class BakingOperator(object):
             context.object.animation_data.action = bpy.data.actions.new("%sAction" % context.object.name)
 
         action = context.object.animation_data.action
-        self.frame_start = int(action.frame_range[0])
-        self.frame_end = int(action.frame_range[1])
+        
+        action_start = int(action.frame_range[0])
+        action_end = int(action.frame_range[1])
+        if action_start == action_end:
+            self.frame_start = context.scene.frame_start
+            self.frame_end = context.scene.frame_end
+        else:
+            self.frame_start = action_start
+            self.frame_end = action_end
 
         return context.window_manager.invoke_props_dialog(self)
 
@@ -202,24 +263,35 @@ class BakingOperator(object):
         self.layout.prop(self, 'frame_end')
         self.layout.prop(self, 'keyframe_tolerance')
 
-    def _create_euler_evaluator(self, action, source_bone):
+    def _create_euler_evaluator(self, action, source_bone, anim_data=None):
         fcurve_name = 'pose.bones["%s"].rotation_euler' % source_bone.name
-        fc_root_rot = [action.fcurves.find(fcurve_name, index=i) for i in range(3)]
+        channelbag = _get_channelbag(action, anim_data, ensure=True)
+        fcurves = channelbag.fcurves if channelbag and hasattr(channelbag, "fcurves") else _get_action_fcurves(action, anim_data)
+        fc_root_rot = [fcurves.find(fcurve_name, index=i) if fcurves else None for i in range(3)]
         return EulerToQuaternionFCurvesEvaluator(FCurvesEvaluator(fc_root_rot, default_value=(.0, .0, .0)))
 
-    def _create_quaternion_evaluator(self, action, source_bone):
+    def _create_quaternion_evaluator(self, action, source_bone, anim_data=None):
         fcurve_name = 'pose.bones["%s"].rotation_quaternion' % source_bone.name
-        fc_root_rot = [action.fcurves.find(fcurve_name, index=i) for i in range(4)]
+        channelbag = _get_channelbag(action, anim_data, ensure=True)
+        fcurves = channelbag.fcurves if channelbag and hasattr(channelbag, "fcurves") else _get_action_fcurves(action, anim_data)
+        fc_root_rot = [fcurves.find(fcurve_name, index=i) if fcurves else None for i in range(3)]
+        
         return QuaternionFCurvesEvaluator(FCurvesEvaluator(fc_root_rot, default_value=(1.0, .0, .0, .0)))
 
-    def _create_location_evaluator(self, action, source_bone):
+    def _create_location_evaluator(self, action, source_bone, anim_data=None):
         fcurve_name = 'pose.bones["%s"].location' % source_bone.name
-        fc_root_loc = [action.fcurves.find(fcurve_name, index=i) for i in range(3)]
+        channelbag = _get_channelbag(action, anim_data, ensure=True)
+        fcurves = channelbag.fcurves if channelbag and hasattr(channelbag, "fcurves") else _get_action_fcurves(action, anim_data)
+        fc_root_loc = [fcurves.find(fcurve_name, index=i) if fcurves else None for i in range(3)]
+        
         return VectorFCurvesEvaluator(FCurvesEvaluator(fc_root_loc, default_value=(.0, .0, .0)))
 
-    def _create_scale_evaluator(self, action, source_bone):
+    def _create_scale_evaluator(self, action, source_bone, anim_data=None):
         fcurve_name = 'pose.bones["%s"].scale' % source_bone.name
-        fc_root_loc = [action.fcurves.find(fcurve_name, index=i) for i in range(3)]
+        channelbag = _get_channelbag(action, anim_data, ensure=True)
+        fcurves = channelbag.fcurves if channelbag and hasattr(channelbag, "fcurves") else _get_action_fcurves(action, anim_data)
+        fc_root_loc = [fcurves.find(fcurve_name, index=i) if fcurves else None for i in range(3)]
+        
         return VectorFCurvesEvaluator(FCurvesEvaluator(fc_root_loc, default_value=(1.0, 1.0, 1.0)))
 
     def _bake_action(self, context, *source_bones):
@@ -227,18 +299,20 @@ class BakingOperator(object):
         nla_tweak_mode = context.object.animation_data.use_tweak_mode if hasattr(context.object.animation_data,
                                                                                  'use_tweak_mode') else False
 
-        # saving context
-        selected_bones = [b for b in context.object.data.bones if b.select]
+        # saving context (pose bones, not data bones)
+        selected_bones = [pb for pb in context.object.pose.bones if getattr(pb, "select", False)]
         mode = context.object.mode
-        for b in selected_bones:
-            b.select = False
+        bpy.ops.object.mode_set(mode='POSE')
+        for pb in selected_bones:
+            pb.select = False
 
-        bpy.ops.object.mode_set(mode='OBJECT')
         source_bones_matrix_basis = []
         for source_bone in source_bones:
-            source_bones_matrix_basis.append(context.object.pose.bones[source_bone.name].matrix_basis.copy())
-            source_bone.select = True
+            pb = context.object.pose.bones[source_bone.name]
+            source_bones_matrix_basis.append(pb.matrix_basis.copy())
+            pb.select = True
 
+        bpy.ops.object.mode_set(mode='OBJECT')
         bake_options = serialize_bake_options()
         baked_action = bpy_extras.anim_utils.bake_action(
             context.object,
@@ -249,10 +323,11 @@ class BakingOperator(object):
 
         # restoring context
         for source_bone, matrix_basis in zip(source_bones, source_bones_matrix_basis):
-            context.object.pose.bones[source_bone.name].matrix_basis = matrix_basis
-            source_bone.select = False
-        for b in selected_bones:
-            b.select = True
+            pb = context.object.pose.bones[source_bone.name]
+            pb.matrix_basis = matrix_basis
+            pb.select = False
+        for pb in selected_bones:
+            pb.select = True
 
         bpy.ops.object.mode_set(mode=mode)
 
@@ -302,10 +377,12 @@ class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
         finally:
             bpy.data.actions.remove(baked_action)
 
-    def _evaluate_distance_per_frame(self, action, bone, brake_bone):
-        loc_evaluator = self._create_location_evaluator(action, bone)
-        rot_evaluator = self._create_euler_evaluator(action, bone)
-        brake_evaluator = self._create_scale_evaluator(action, brake_bone)
+    def _evaluate_distance_per_frame(self, context, action, bone, brake_bone):
+        anim_data = context.object.animation_data
+
+        loc_evaluator = self._create_location_evaluator(action, bone, anim_data=anim_data)
+        rot_evaluator = self._create_euler_evaluator(action, bone, anim_data=anim_data)
+        brake_evaluator = self._create_scale_evaluator(action, brake_bone, anim_data=anim_data)
 
         radius = bone.length if bone.length > .0 else 1.0
         bone_init_vector = (bone.head_local - bone.tail_local).normalized()
@@ -340,7 +417,7 @@ class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
         pb: bpy.types.PoseBone = context.object.pose.bones[bone.name]
         pb.matrix_basis.identity()
 
-        for f, distance in self._evaluate_distance_per_frame(baked_action, bone, brake_bone):
+        for f, distance in self._evaluate_distance_per_frame(context, baked_action, bone, brake_bone):
             kf = fc_rot.keyframe_points.insert(f, distance)
             kf.interpolation = 'LINEAR'
             kf.type = 'JITTER'
@@ -371,9 +448,11 @@ class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
                 self._bake_steering_rotation(context, bone_offset, mch_steering_rotation)
         return {'FINISHED'}
 
-    def _evaluate_rotation_per_frame(self, action, bone_offset, bone):
-        loc_evaluator = self._create_location_evaluator(action, bone)
-        rot_evaluator = self._create_quaternion_evaluator(action, bone)
+    def _evaluate_rotation_per_frame(self, context, action, bone_offset, bone):
+        anim_data = context.object.animation_data
+
+        loc_evaluator = self._create_location_evaluator(action, bone, anim_data=anim_data)
+        rot_evaluator = self._create_quaternion_evaluator(action, bone, anim_data=anim_data)
 
         distance_threshold = pow(bone_offset * max(self.keyframe_tolerance, .001), 2)
         steering_threshold = bone_offset * self.keyframe_tolerance * .1
@@ -429,7 +508,7 @@ class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
             pb: bpy.types.PoseBone = context.object.pose.bones[bone.name]
             pb.matrix_basis.identity()
 
-            for f, steering_pos in self._evaluate_rotation_per_frame(baked_action, bone_offset, bone):
+            for f, steering_pos in self._evaluate_rotation_per_frame(context, baked_action, bone_offset, bone):
                 kf = fc_rot.keyframe_points.insert(f, steering_pos)
                 kf.type = 'JITTER'
                 kf.interpolation = 'LINEAR'

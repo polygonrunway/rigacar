@@ -47,18 +47,18 @@ def create_constraint_influence_driver(ob, cns, driver_data_path, base_influence
     var = drv.variables.new()
     var.name = 'influence'
     var.type = 'SINGLE_PROP'
-
     targ = var.targets[0]
     targ.id_type = 'OBJECT'
     targ.id = ob
     targ.data_path = driver_data_path
 
     if base_influence != 1.0:
-        fmod = fcurve.modifiers[0]
+        fmod = next((m for m in fcurve.modifiers if m.type == 'GENERATOR'), None)
+        if fmod is None:
+            fmod = fcurve.modifiers.new(type='GENERATOR')
         fmod.mode = 'POLYNOMIAL'
         fmod.poly_order = 1
         fmod.coefficients = (0, base_influence)
-
 
 def create_rotation_euler_x_driver(ob, bone, driver_data_path):
     fcurve = bone.driver_add('rotation_euler', 0)
