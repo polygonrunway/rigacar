@@ -25,10 +25,16 @@ import math
 import itertools
 import re
 
+
+# ------------------------------------------------------------------------
+#  Action / channelbag helpers (used only for property FCurves)
+# ------------------------------------------------------------------------
+
 def _unwrap_action(action_ref):
     if action_ref is None:
         return None
     return action_ref.action if hasattr(action_ref, "action") else action_ref
+
 
 def _get_action_slot(anim_data):
     if anim_data is None:
@@ -39,6 +45,7 @@ def _get_action_slot(anim_data):
     if slots is not None:
         return getattr(slots, "active", None)
     return None
+
 
 def _get_channelbag(action, anim_data=None, ensure=False):
     if action is None:
@@ -53,12 +60,22 @@ def _get_channelbag(action, anim_data=None, ensure=False):
         pass
     return None
 
+
 def _get_action_fcurves(action_ref, anim_data=None):
+    """
+    Read-only access to fcurves for a given action/slot.
+    We do NOT "ensure" channelbags here to avoid creating empty ones.
+    """
     action = _unwrap_action(action_ref)
-    channelbag = _get_channelbag(action, anim_data, ensure=True)
+    channelbag = _get_channelbag(action, anim_data, ensure=False)
     if channelbag and hasattr(channelbag, "fcurves"):
         return channelbag.fcurves
     return getattr(action, "fcurves", None)
+
+
+# ------------------------------------------------------------------------
+#  Small utilities
+# ------------------------------------------------------------------------
 
 def cursor(cursor_mode):
     def cursor_decorator(func):
@@ -111,120 +128,94 @@ def find_wheelbrake_bone(bones, position, side, index):
 
 
 def clear_property_animation(context, property_name, remove_keyframes=True):
-    if remove_keyframes and context.object.animation_data and context.object.animation_data.action:
+    """
+    Remove the FCurve for a given custom property (if present)
+    and reset the property to 0.0.
+    """
+    obj = context.object
+    anim_data = obj.animation_data
+
+    if remove_keyframes and anim_data and anim_data.action:
         fcurve_datapath = '["%s"]' % property_name
-        action = _unwrap_action(context.object.animation_data.action)
-        channelbag = _get_channelbag(action, context.object.animation_data, ensure=False)
+        action = _unwrap_action(anim_data.action)
+        channelbag = _get_channelbag(action, anim_data, ensure=False)
         if channelbag and hasattr(channelbag, "fcurves"):
             fcurve = channelbag.fcurves.find(fcurve_datapath, index=0)
             if fcurve is not None:
                 channelbag.fcurves.remove(fcurve)
         else:
-            fcurves = _get_action_fcurves(context.object.animation_data.action, context.object.animation_data)
+            fcurves = _get_action_fcurves(anim_data.action, anim_data)
             if fcurves is not None:
                 fcurve = fcurves.find(fcurve_datapath)
                 if fcurve is not None:
                     fcurves.remove(fcurve)
-    context.object[property_name] = .0
+
+    obj[property_name] = 0.0
 
 
 def create_property_animation(context, property_name):
-    if context.object.animation_data is None:
-        context.object.animation_data_create()
-    anim_data = context.object.animation_data
+    """
+    Ensure there is an FCurve for a given custom property and return it.
+    """
+    obj = context.object
+    if obj.animation_data is None:
+        obj.animation_data_create()
+    anim_data = obj.animation_data
     if anim_data.action is None:
-        anim_data.action = bpy.data.actions.new("%sAction" % context.object.name)
+        anim_data.action = bpy.data.actions.new("%sAction" % obj.name)
+
     action = _unwrap_action(anim_data.action)
     channelbag = _get_channelbag(action, anim_data, ensure=True)
     fcurve_datapath = '["%s"]' % property_name
+
     if channelbag and hasattr(channelbag, "fcurves"):
-        return channelbag.fcurves.ensure(data_path=fcurve_datapath, index=0, group_name='Wheels rotation')
+        return channelbag.fcurves.ensure(
+            data_path=fcurve_datapath,
+            index=0,
+            group_name='Wheels rotation'
+        )
+
     fcurves = _get_action_fcurves(anim_data.action, anim_data)
     if fcurves:
         existing = fcurves.find(fcurve_datapath)
-        return existing or fcurves.new(fcurve_datapath, index=0, action_group='Wheels rotation')
+        return existing or fcurves.new(
+            fcurve_datapath,
+            index=0,
+            action_group='Wheels rotation'
+        )
     return None
-
-
-class FCurvesEvaluator(object):
-    """Encapsulates a bunch of FCurves for vector animations."""
-
-    def __init__(self, fcurves, default_value):
-        self.default_value = default_value
-        self.fcurves = fcurves
-
-    def evaluate(self, f):
-        result = []
-        for fcurve, value in zip(self.fcurves, self.default_value):
-            if fcurve is not None:
-                result.append(fcurve.evaluate(f))
-            else:
-                result.append(value)
-        return result
-
-
-class VectorFCurvesEvaluator(object):
-
-    def __init__(self, fcurves_evaluator):
-        self.fcurves_evaluator = fcurves_evaluator
-
-    def evaluate(self, f):
-        return mathutils.Vector(self.fcurves_evaluator.evaluate(f))
-
-
-class EulerToQuaternionFCurvesEvaluator(object):
-
-    def __init__(self, fcurves_evaluator):
-        self.fcurves_evaluator = fcurves_evaluator
-
-    def evaluate(self, f):
-        return mathutils.Euler(self.fcurves_evaluator.evaluate(f)).to_quaternion()
-
-
-class QuaternionFCurvesEvaluator(object):
-
-    def __init__(self, fcurves_evaluator):
-        self.fcurves_evaluator = fcurves_evaluator
-
-    def evaluate(self, f):
-        return mathutils.Quaternion(self.fcurves_evaluator.evaluate(f))
 
 
 def fix_old_steering_rotation(rig_object):
     """
-    Fix  armature generated with Rigacar version < 6.0
+    Fix armature generated with Rigacar version < 6.0
     """
     if rig_object.pose and rig_object.pose.bones:
         if 'MCH-Steering.rotation' in rig_object.pose.bones:
             rig_object.pose.bones['MCH-Steering.rotation'].rotation_mode = 'QUATERNION'
 
 
-def serialize_bake_options():
-    # For older versions than 4.1
-    if bpy.app.version < (4, 1, 0):
-        return dict(
-            only_selected=True,
-            do_pose=True,
-            do_object=False,
-            do_visual_keying=True
-        )
-    # For latest versions
-    return dict(bake_options=bpy_extras.anim_utils.BakeOptions(
-            only_selected=True,
-            do_pose=True,
-            do_object=False,
-            do_visual_keying=True,
-            do_constraint_clear=False,
-            do_parents_clear=False,
-            do_clean=False,
-            do_location=True,
-            do_scale=True,
-            do_rotation=True,
-            do_bbone=True,
-            do_custom_props=True
-        )
-    )
+def _guess_root_bone_name(obj: bpy.types.Object) -> str:
+    """
+    Try to find the main root/body bone to measure car motion from.
+    """
+    # Common names first
+    for name in ("Root", "root", "ROOT", "Body", "body", "ROOT_M"):
+        if name in obj.pose.bones:
+            return name
 
+    # Fallback: first bone without parent
+    for pb in obj.pose.bones:
+        if pb.parent is None:
+            return pb.name
+
+    # Last resort
+    return next(iter(obj.pose.bones.keys()))
+
+
+# ------------------------------------------------------------------------
+#  Base class for baking operators
+# ------------------------------------------------------------------------
 
 class BakingOperator(object):
     frame_start: bpy.props.IntProperty(name='Start Frame', min=1)
@@ -233,20 +224,25 @@ class BakingOperator(object):
 
     @classmethod
     def poll(cls, context):
-        return ('Car Rig' in context.object.data and
-                context.object.data['Car Rig'] and
-                context.object.mode in ('POSE', 'OBJECT'))
+        return (
+            context.object is not None and
+            context.object.data is not None and
+            'Car Rig' in context.object.data and
+            context.object.data['Car Rig'] and
+            context.object.mode in {'POSE', 'OBJECT'}
+        )
 
     def invoke(self, context, event):
-        if context.object.animation_data is None:
-            context.object.animation_data_create()
-        if context.object.animation_data.action is None:
-            context.object.animation_data.action = bpy.data.actions.new("%sAction" % context.object.name)
+        obj = context.object
+        if obj.animation_data is None:
+            obj.animation_data_create()
+        if obj.animation_data.action is None:
+            obj.animation_data.action = bpy.data.actions.new("%sAction" % obj.name)
 
-        action = context.object.animation_data.action
-        
+        action = obj.animation_data.action
         action_start = int(action.frame_range[0])
         action_end = int(action.frame_range[1])
+
         if action_start == action_end:
             self.frame_start = context.scene.frame_start
             self.frame_end = context.scene.frame_end
@@ -263,81 +259,10 @@ class BakingOperator(object):
         self.layout.prop(self, 'frame_end')
         self.layout.prop(self, 'keyframe_tolerance')
 
-    def _create_euler_evaluator(self, action, source_bone, anim_data=None):
-        fcurve_name = 'pose.bones["%s"].rotation_euler' % source_bone.name
-        channelbag = _get_channelbag(action, anim_data, ensure=True)
-        fcurves = channelbag.fcurves if channelbag and hasattr(channelbag, "fcurves") else _get_action_fcurves(action, anim_data)
-        fc_root_rot = [fcurves.find(fcurve_name, index=i) if fcurves else None for i in range(3)]
-        return EulerToQuaternionFCurvesEvaluator(FCurvesEvaluator(fc_root_rot, default_value=(.0, .0, .0)))
 
-    def _create_quaternion_evaluator(self, action, source_bone, anim_data=None):
-        fcurve_name = 'pose.bones["%s"].rotation_quaternion' % source_bone.name
-        channelbag = _get_channelbag(action, anim_data, ensure=True)
-        fcurves = channelbag.fcurves if channelbag and hasattr(channelbag, "fcurves") else _get_action_fcurves(action, anim_data)
-        fc_root_rot = [fcurves.find(fcurve_name, index=i) if fcurves else None for i in range(3)]
-        
-        return QuaternionFCurvesEvaluator(FCurvesEvaluator(fc_root_rot, default_value=(1.0, .0, .0, .0)))
-
-    def _create_location_evaluator(self, action, source_bone, anim_data=None):
-        fcurve_name = 'pose.bones["%s"].location' % source_bone.name
-        channelbag = _get_channelbag(action, anim_data, ensure=True)
-        fcurves = channelbag.fcurves if channelbag and hasattr(channelbag, "fcurves") else _get_action_fcurves(action, anim_data)
-        fc_root_loc = [fcurves.find(fcurve_name, index=i) if fcurves else None for i in range(3)]
-        
-        return VectorFCurvesEvaluator(FCurvesEvaluator(fc_root_loc, default_value=(.0, .0, .0)))
-
-    def _create_scale_evaluator(self, action, source_bone, anim_data=None):
-        fcurve_name = 'pose.bones["%s"].scale' % source_bone.name
-        channelbag = _get_channelbag(action, anim_data, ensure=True)
-        fcurves = channelbag.fcurves if channelbag and hasattr(channelbag, "fcurves") else _get_action_fcurves(action, anim_data)
-        fc_root_loc = [fcurves.find(fcurve_name, index=i) if fcurves else None for i in range(3)]
-        
-        return VectorFCurvesEvaluator(FCurvesEvaluator(fc_root_loc, default_value=(1.0, 1.0, 1.0)))
-
-    def _bake_action(self, context, *source_bones):
-        action = context.object.animation_data.action
-        nla_tweak_mode = context.object.animation_data.use_tweak_mode if hasattr(context.object.animation_data,
-                                                                                 'use_tweak_mode') else False
-
-        # saving context (pose bones, not data bones)
-        selected_bones = [pb for pb in context.object.pose.bones if getattr(pb, "select", False)]
-        mode = context.object.mode
-        bpy.ops.object.mode_set(mode='POSE')
-        for pb in selected_bones:
-            pb.select = False
-
-        source_bones_matrix_basis = []
-        for source_bone in source_bones:
-            pb = context.object.pose.bones[source_bone.name]
-            source_bones_matrix_basis.append(pb.matrix_basis.copy())
-            pb.select = True
-
-        bpy.ops.object.mode_set(mode='OBJECT')
-        bake_options = serialize_bake_options()
-        baked_action = bpy_extras.anim_utils.bake_action(
-            context.object,
-            action=None,
-            frames=range(self.frame_start, self.frame_end + 1),
-            **bake_options
-        )
-
-        # restoring context
-        for source_bone, matrix_basis in zip(source_bones, source_bones_matrix_basis):
-            pb = context.object.pose.bones[source_bone.name]
-            pb.matrix_basis = matrix_basis
-            pb.select = False
-        for pb in selected_bones:
-            pb.select = True
-
-        bpy.ops.object.mode_set(mode=mode)
-
-        if nla_tweak_mode:
-            context.object.animation_data.use_tweak_mode = nla_tweak_mode
-        else:
-            context.object.animation_data.action = action
-
-        return baked_action
-
+# ------------------------------------------------------------------------
+#  Wheel rotation bake operator
+# ------------------------------------------------------------------------
 
 class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
     bl_idname = 'anim.car_wheels_rotation_bake'
@@ -357,71 +282,123 @@ class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
         wheel_bones = []
         brake_bones = []
         for position, side in itertools.product(('Ft', 'Bk'), ('L', 'R')):
-            for index, wheel_bone in enumerate(bone_range(bones, 'MCH-Wheel.rotation', position, side)):
+            for index, wheel_bone in enumerate(
+                bone_range(bones, 'MCH-Wheel.rotation', position, side)
+            ):
                 wheel_bones.append(wheel_bone)
-                brake_bones.append(find_wheelbrake_bone(bones, position, side, index) or wheel_bone)
+                brake_bones.append(
+                    find_wheelbrake_bone(bones, position, side, index) or wheel_bone
+                )
 
+        # Clear old wheel property animations
         for property_name in map(lambda wheel_bone: wheel_bone.name.replace('MCH-', ''), wheel_bones):
             clear_property_animation(context, property_name)
 
-        bones = set(wheel_bones + brake_bones)
-        baked_action = self._bake_action(context, *bones)
+        # Bake each wheel property from evaluated motion
+        for wheel_bone, brake_bone in zip(wheel_bones, brake_bones):
+            self._bake_wheel_rotation(context, wheel_bone, brake_bone)
 
-        if baked_action is None:
-            self.report({'WARNING'}, "Existing action failed to bake. Won't bake wheel rotation")
-            return
+    def _evaluate_distance_per_frame(self, context, bone, brake_bone):
+        """
+        Compute travel distance per frame based on the *armature object's*
+        world-space motion, then convert to wheel rotation.
 
-        try:
-            for wheel_bone, brake_bone in zip(wheel_bones, brake_bones):
-                self._bake_wheel_rotation(context, baked_action, wheel_bone, brake_bone)
-        finally:
-            bpy.data.actions.remove(baked_action)
+        This covers the common case where the path/constraint is on the
+        armature object instead of a specific root bone.
+        """
+        scene = context.scene
+        obj = context.object
+        depsgraph = context.evaluated_depsgraph_get()
 
-    def _evaluate_distance_per_frame(self, context, action, bone, brake_bone):
-        anim_data = context.object.animation_data
+        # Wheel radius from the wheel MCH bone length
+        radius = bone.length * 0.5 if bone.length > 0.0 else 1.0
 
-        loc_evaluator = self._create_location_evaluator(action, bone, anim_data=anim_data)
-        rot_evaluator = self._create_euler_evaluator(action, bone, anim_data=anim_data)
-        brake_evaluator = self._create_scale_evaluator(action, brake_bone, anim_data=anim_data)
+        # Assume car forward is +Y in object local space
+        forward_local = mathutils.Vector((0.0, 1.0, 0.0))
 
-        radius = bone.length if bone.length > .0 else 1.0
-        bone_init_vector = (bone.head_local - bone.tail_local).normalized()
-        prev_pos = loc_evaluator.evaluate(self.frame_start)
-        prev_speed = 0
-        distance = 0
+        def sample(frame):
+            scene.frame_set(frame)
+            eval_obj = obj.evaluated_get(depsgraph)
+
+            # Object world transform
+            mat_obj = eval_obj.matrix_world
+            pos = mat_obj.translation.copy()
+            rot_q = mat_obj.to_quaternion()
+
+            # Brake from brake bone (pose space)
+            brake_pb = eval_obj.pose.bones[brake_bone.name]
+            brake_y = brake_pb.scale.y
+
+            return pos, rot_q, brake_y
+
+        # Initial state
+        prev_pos, prev_rot_q, prev_brake_y = sample(self.frame_start)
+        distance = 0.0
+        prev_speed = 0.0
+
+        # Always put a key on the first frame
         yield self.frame_start, distance
-        for f in range(self.frame_start + 1, self.frame_end):
-            pos = loc_evaluator.evaluate(f)
-            speed_vector = pos - prev_pos
-            speed_vector *= 2 * brake_evaluator.evaluate(f).y - 1
-            rotation_quaternion = rot_evaluator.evaluate(f)
-            bone_orientation = rotation_quaternion @ bone_init_vector
-            speed = math.copysign(speed_vector.magnitude, bone_orientation.dot(speed_vector))
-            speed /= radius
+
+        for f in range(self.frame_start + 1, self.frame_end + 1):
+            pos, rot_q, brake_y = sample(f)
+
+            # Linear displacement this frame
+            speed_vec = pos - prev_pos
+
+            # Apply brake factor as original (2 * scale_y - 1)
+            speed_vec *= (2.0 * brake_y - 1.0)
+
+            # Signed speed along car forward direction
+            forward_world = rot_q @ forward_local
+            speed = speed_vec.length
+            if speed != 0.0:
+                speed = math.copysign(speed, forward_world.dot(speed_vec))
+
+            # Convert linear distance to wheel angle (radians)
+            angular_speed = -speed / (2.0 * math.pi * radius)
+
             drop_keyframe = False
-            if speed == .0:
-                drop_keyframe = prev_speed == speed
-            elif prev_speed != .0:
-                drop_keyframe = abs(1 - prev_speed / speed) < self.keyframe_tolerance / 10
+            if angular_speed == 0.0:
+                drop_keyframe = (prev_speed == angular_speed)
+            elif prev_speed != 0.0:
+                drop_keyframe = abs(1.0 - prev_speed / angular_speed) < self.keyframe_tolerance / 10.0
+
             if not drop_keyframe:
-                prev_speed = speed
+                prev_speed = angular_speed
+                # Key on previous frame (matches original logic)
                 yield f - 1, distance
-            distance += speed
+
+            distance += angular_speed
             prev_pos = pos
+
+        # Final frame
         yield self.frame_end, distance
 
-    def _bake_wheel_rotation(self, context, baked_action, bone, brake_bone):
-        fc_rot = create_property_animation(context, bone.name.replace('MCH-', ''))
+    def _bake_wheel_rotation(self, context, bone, brake_bone):
+        """
+        Create/update the custom property FCurve on the original action,
+        based on evaluated rig motion.
+        """
+        # Ensure FCurve exists for this wheel property
+        prop_name = bone.name.replace('MCH-', '')
+        fc_rot = create_property_animation(context, prop_name)
+        if fc_rot is None:
+            return
 
-        # Reset the transform of the wheel bone, otherwise baking yields wrong results
+        # Reset wheel bone local transform to avoid interference
         pb: bpy.types.PoseBone = context.object.pose.bones[bone.name]
         pb.matrix_basis.identity()
 
-        for f, distance in self._evaluate_distance_per_frame(context, baked_action, bone, brake_bone):
+        # Evaluate distance (integrated angle) and key it
+        for f, distance in self._evaluate_distance_per_frame(context, bone, brake_bone):
             kf = fc_rot.keyframe_points.insert(f, distance)
             kf.interpolation = 'LINEAR'
             kf.type = 'JITTER'
 
+
+# ------------------------------------------------------------------------
+#  Steering bake operator
+# ------------------------------------------------------------------------
 
 class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
     bl_idname = 'anim.car_steering_bake'
@@ -429,7 +406,11 @@ class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
     bl_description = 'Automatically generates steering animation based on Root bone animation.'
     bl_options = {'REGISTER', 'UNDO'}
 
-    rotation_factor: bpy.props.FloatProperty(name='Rotation factor', min=.1, default=1)
+    rotation_factor: bpy.props.FloatProperty(
+        name='Rotation factor',
+        min=.1,
+        default=1.0
+    )
 
     def draw(self, context):
         self.layout.use_property_split = True
@@ -441,80 +422,88 @@ class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
 
     def execute(self, context):
         if self.frame_end > self.frame_start:
-            if 'Steering' in context.object.data.bones and 'MCH-Steering.rotation' in context.object.data.bones:
-                steering = context.object.data.bones['Steering']
-                mch_steering_rotation = context.object.data.bones['MCH-Steering.rotation']
+            bones = context.object.data.bones
+            if 'Steering' in bones and 'MCH-Steering.rotation' in bones:
+                steering = bones['Steering']
+                mch_steering_rotation = bones['MCH-Steering.rotation']
                 bone_offset = abs(steering.head_local.y - mch_steering_rotation.head_local.y)
                 self._bake_steering_rotation(context, bone_offset, mch_steering_rotation)
         return {'FINISHED'}
 
-    def _evaluate_rotation_per_frame(self, context, action, bone_offset, bone):
-        anim_data = context.object.animation_data
+    def _wrap_angle(self, angle):
+        """Wrap angle to [-pi, pi] for stable deltas."""
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
 
-        loc_evaluator = self._create_location_evaluator(action, bone, anim_data=anim_data)
-        rot_evaluator = self._create_quaternion_evaluator(action, bone, anim_data=anim_data)
+    def _evaluate_rotation_per_frame(self, context, bone_offset, bone):
+        """
+        Compute steering per frame based on the *rate of change* of the
+        armature object's heading, and output a value for EVERY frame.
 
-        distance_threshold = pow(bone_offset * max(self.keyframe_tolerance, .001), 2)
-        steering_threshold = bone_offset * self.keyframe_tolerance * .1
-        bone_direction_vector = (bone.head_local - bone.tail_local).normalized()
-        bone_normal_vector = mathutils.Vector((1, 0, 0))
+        This:
+        - goes back to ~0 on straight sections (heading stops changing),
+        - is smooth (we use central differences, no keyframe decimation),
+        - lets the FCurve interpolation handle the 'lerp' between directions.
+        """
+        scene = context.scene
+        obj = context.object
+        depsgraph = context.evaluated_depsgraph_get()
 
-        current_pos = loc_evaluator.evaluate(self.frame_start)
-        previous_steering_position = None
-        for f in range(self.frame_start, self.frame_end - 1):
-            next_pos = loc_evaluator.evaluate(f + 1)
-            steering_direction_vector = next_pos - current_pos
+        # Car forward axis in object local space
+        forward_local = mathutils.Vector((0.0, 1.0, 0.0))
 
-            if steering_direction_vector.length_squared < distance_threshold:
-                continue
+        def heading_at(frame):
+            scene.frame_set(frame)
+            eval_obj = obj.evaluated_get(depsgraph)
+            mat_obj = eval_obj.matrix_world
+            forward_world = mat_obj.to_quaternion() @ forward_local
+            # Heading in ground plane (X–Y)
+            return math.atan2(forward_world.x, forward_world.y)
 
-            rotation_quaternion = rot_evaluator.evaluate(f)
-            world_space_bone_direction_vector = rotation_quaternion @ bone_direction_vector
-            world_space_bone_normal_vector = rotation_quaternion @ bone_normal_vector
+        # Pre-sample headings for a small neighborhood around the range
+        headings = {}
+        for f in range(self.frame_start - 1, self.frame_end + 2):
+            headings[f] = heading_at(f)
 
-            projected_steering_direction = steering_direction_vector.dot(world_space_bone_direction_vector)
-            if projected_steering_direction == 0:
-                continue
+        # Central difference per-frame heading change
+        for f in range(self.frame_start, self.frame_end):
+            h_prev = headings.get(f - 1, headings[f])
+            h_next = headings.get(f + 1, headings[f])
 
-            length_ratio = bone_offset * self.rotation_factor / projected_steering_direction
-            steering_direction_vector *= length_ratio
+            # Central difference (note the 0.5 factor)
+            delta_heading = self._wrap_angle(h_next - h_prev) * 0.5
 
-            steering_position = mathutils.geometry.distance_point_to_plane(steering_direction_vector,
-                                                                           world_space_bone_direction_vector,
-                                                                           world_space_bone_normal_vector)
-
-            if previous_steering_position is not None \
-                    and abs(steering_position - previous_steering_position) < steering_threshold:
-                continue
+            # Steering proportional to turning rate.
+            # Flip the sign if the direction is reversed in your rig.
+            steering_position = -delta_heading * self.rotation_factor * 180
 
             yield f, steering_position
-            current_pos = next_pos
-            previous_steering_position = steering_position
 
     @cursor('WAIT')
     def _bake_steering_rotation(self, context, bone_offset, bone):
         clear_property_animation(context, 'Steering.rotation')
         fix_old_steering_rotation(context.object)
         fc_rot = create_property_animation(context, 'Steering.rotation')
-
-        baked_action = self._bake_action(context, bone)
-        if baked_action is None:
-            self.report({'WARNING'}, "Existing action failed to bake. Won't bake steering rotation")
+        if fc_rot is None:
             return
 
-        try:
-            # Reset the transform of the steering bone, because baking action manipulates the transform
-            # and evaluate_rotation_frame expects it at it's default position
-            pb: bpy.types.PoseBone = context.object.pose.bones[bone.name]
-            pb.matrix_basis.identity()
+        # Reset steering bone local transform
+        pb: bpy.types.PoseBone = context.object.pose.bones[bone.name]
+        pb.matrix_basis.identity()
 
-            for f, steering_pos in self._evaluate_rotation_per_frame(context, baked_action, bone_offset, bone):
-                kf = fc_rot.keyframe_points.insert(f, steering_pos)
-                kf.type = 'JITTER'
-                kf.interpolation = 'LINEAR'
-        finally:
-            bpy.data.actions.remove(baked_action)
+        # Evaluate steering directly from evaluated rig
+        for f, steering_pos in self._evaluate_rotation_per_frame(context, bone_offset, bone):
+            kf = fc_rot.keyframe_points.insert(f, steering_pos)
+            kf.type = 'KEYFRAME'
+            kf.interpolation = 'BEZIER'
 
+
+# ------------------------------------------------------------------------
+#  Clear baked animation operator
+# ------------------------------------------------------------------------
 
 class ANIM_OT_carClearSteeringWheelsRotation(bpy.types.Operator):
     bl_idname = "anim.car_clear_steering_wheels_rotation"
@@ -522,10 +511,16 @@ class ANIM_OT_carClearSteeringWheelsRotation(bpy.types.Operator):
     bl_description = "Clear generated rotation for steering and wheels"
     bl_options = {'REGISTER', 'UNDO'}
 
-    clear_steering: bpy.props.BoolProperty(name="Steering", description="Clear generated animation for steering",
-                                           default=True)
-    clear_wheels: bpy.props.BoolProperty(name="Wheels", description="Clear generated animation for wheels",
-                                         default=True)
+    clear_steering: bpy.props.BoolProperty(
+        name="Steering",
+        description="Clear generated animation for steering",
+        default=True
+    )
+    clear_wheels: bpy.props.BoolProperty(
+        name="Wheels",
+        description="Clear generated animation for wheels",
+        default=True
+    )
 
     def draw(self, context):
         self.layout.use_property_decorate = False
@@ -535,7 +530,11 @@ class ANIM_OT_carClearSteeringWheelsRotation(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.object is not None and context.object.data is not None and context.object.data.get('Car Rig')
+        return (
+            context.object is not None and
+            context.object.data is not None and
+            context.object.data.get('Car Rig')
+        )
 
     def execute(self, context):
         re_wheel_propname = re.compile(r'^Wheel\.rotation\.(Ft|Bk)\.[LR](\.\d+)?$')
@@ -544,14 +543,17 @@ class ANIM_OT_carClearSteeringWheelsRotation(bpy.types.Operator):
                 clear_property_animation(context, prop, remove_keyframes=self.clear_steering)
             elif re_wheel_propname.match(prop):
                 clear_property_animation(context, prop, remove_keyframes=self.clear_wheels)
-        # this is a hack to force Blender to take into account the modification
-        # of the properties by changing the object mode.
-        # Don't know yet if it is specific to blender 2.80
+
+        # Hack to force Blender to refresh custom property drivers etc.
         mode = context.object.mode
         bpy.ops.object.mode_set(mode='OBJECT' if mode == 'POSE' else 'POSE')
         bpy.ops.object.mode_set(mode=mode)
         return {'FINISHED'}
 
+
+# ------------------------------------------------------------------------
+#  Registration
+# ------------------------------------------------------------------------
 
 def register():
     bpy.utils.register_class(ANIM_OT_carWheelsRotationBake)
