@@ -2,7 +2,7 @@
 
 ## Fork
 
-_This fork supports **Blender 4.0+** and consolidates fixes from the community while the maintainer is absent._
+_This fork supports **Blender 5.0+**_
 
 Upstream readme description below.
 
@@ -14,8 +14,4 @@ Rigacar is a free addon for Blender. It is designed to fulfill the following goa
 * provide tools to automate wheels animation
 * allow efficient animation baking to be able to export animated models into real time renderers
 
-Please read [full documentation](http://digicreatures.net/articles/rigacar.html) on my website.
-
-You can also watch the series of video tutorials:
-
-[![Rigacar Part 1](http://img.youtube.com/vi/D3XQxA_-TzY/0.jpg)](https://www.youtube.com/watch?v=D3XQxA_-TzY&list=PLH_mmrv8SfPFiEj93RJt3sBvHCnipI9qK "Rigacar video tutorials")
+Please read [full documentation](http://digicreatures.net/articles/rigacar.html) on website.
