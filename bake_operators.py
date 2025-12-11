@@ -27,10 +27,12 @@ import re
 
 
 # ------------------------------------------------------------------------
-#  Action / channelbag helpers (used only for property FCurves)
+#  Action / channelbag helpers (Blender 5)
 # ------------------------------------------------------------------------
 
+
 def _unwrap_action(action_ref):
+    """Support both plain Action and ActionSlot-like references."""
     if action_ref is None:
         return None
     return action_ref.action if hasattr(action_ref, "action") else action_ref
@@ -48,8 +50,10 @@ def _get_action_slot(anim_data):
 
 
 def _get_channelbag(action, anim_data=None, ensure=False):
+    """Return channelbag for an action/slot if available."""
     if action is None:
         return None
+
     slot = _get_action_slot(anim_data) if anim_data else None
     try:
         if ensure and hasattr(bpy_extras.anim_utils, "action_ensure_channelbag_for_slot"):
@@ -57,6 +61,7 @@ def _get_channelbag(action, anim_data=None, ensure=False):
         if not ensure and hasattr(bpy_extras.anim_utils, "action_get_channelbag_for_slot"):
             return bpy_extras.anim_utils.action_get_channelbag_for_slot(action, slot)
     except Exception:
+        # Be defensive – channelbag helpers may not exist on all versions
         pass
     return None
 
@@ -77,6 +82,7 @@ def _get_action_fcurves(action_ref, anim_data=None):
 #  Small utilities
 # ------------------------------------------------------------------------
 
+
 def cursor(cursor_mode):
     def cursor_decorator(func):
         def wrapper(self, context, *args, **kwargs):
@@ -85,17 +91,15 @@ def cursor(cursor_mode):
                 return func(self, context, *args, **kwargs)
             finally:
                 context.window.cursor_modal_restore()
-
         return wrapper
-
     return cursor_decorator
 
 
 def bone_name(prefix, position, side, index=0):
     if index == 0:
-        return '%s.%s.%s' % (prefix, position, side)
+        return "%s.%s.%s" % (prefix, position, side)
     else:
-        return '%s.%s.%s.%03d' % (prefix, position, side, index)
+        return "%s.%s.%s.%03d" % (prefix, position, side, index)
 
 
 def bone_range(bones, name_prefix, position, side):
@@ -188,39 +192,24 @@ def create_property_animation(context, property_name):
 
 def fix_old_steering_rotation(rig_object):
     """
-    Fix armature generated with Rigacar version < 6.0
+    Fix armature generated with Rigacar version < 6.0 –
+    steering MCH bone must be in quaternion mode.
     """
     if rig_object.pose and rig_object.pose.bones:
-        if 'MCH-Steering.rotation' in rig_object.pose.bones:
-            rig_object.pose.bones['MCH-Steering.rotation'].rotation_mode = 'QUATERNION'
-
-
-def _guess_root_bone_name(obj: bpy.types.Object) -> str:
-    """
-    Try to find the main root/body bone to measure car motion from.
-    """
-    # Common names first
-    for name in ("Root", "root", "ROOT", "Body", "body", "ROOT_M"):
-        if name in obj.pose.bones:
-            return name
-
-    # Fallback: first bone without parent
-    for pb in obj.pose.bones:
-        if pb.parent is None:
-            return pb.name
-
-    # Last resort
-    return next(iter(obj.pose.bones.keys()))
+        pb = rig_object.pose.bones.get("MCH-Steering.rotation")
+        if pb:
+            pb.rotation_mode = 'QUATERNION'
 
 
 # ------------------------------------------------------------------------
 #  Base class for baking operators
 # ------------------------------------------------------------------------
 
+
 class BakingOperator(object):
     frame_start: bpy.props.IntProperty(name='Start Frame', min=1)
     frame_end: bpy.props.IntProperty(name='End Frame', min=1)
-    keyframe_tolerance: bpy.props.FloatProperty(name='Keyframe tolerance', min=0, default=.01)
+    keyframe_tolerance: bpy.props.FloatProperty(name='Keyframe tolerance', min=0.0, default=0.01)
 
     @classmethod
     def poll(cls, context):
@@ -264,6 +253,7 @@ class BakingOperator(object):
 #  Wheel rotation bake operator
 # ------------------------------------------------------------------------
 
+
 class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
     bl_idname = 'anim.car_wheels_rotation_bake'
     bl_label = 'Bake wheels rotation'
@@ -271,6 +261,7 @@ class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        # For compatibility with older rigs that check this flag
         context.object['wheels_on_y_axis'] = False
         self._bake_wheels_rotation(context)
         return {'FINISHED'}
@@ -283,7 +274,7 @@ class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
         brake_bones = []
         for position, side in itertools.product(('Ft', 'Bk'), ('L', 'R')):
             for index, wheel_bone in enumerate(
-                bone_range(bones, 'MCH-Wheel.rotation', position, side)
+                    bone_range(bones, 'MCH-Wheel.rotation', position, side)
             ):
                 wheel_bones.append(wheel_bone)
                 brake_bones.append(
@@ -291,7 +282,7 @@ class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
                 )
 
         # Clear old wheel property animations
-        for property_name in map(lambda wheel_bone: wheel_bone.name.replace('MCH-', ''), wheel_bones):
+        for property_name in map(lambda wb: wb.name.replace('MCH-', ''), wheel_bones):
             clear_property_animation(context, property_name)
 
         # Bake each wheel property from evaluated motion
@@ -301,16 +292,16 @@ class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
     def _evaluate_distance_per_frame(self, context, bone, brake_bone):
         """
         Compute travel distance per frame based on the *armature object's*
-        world-space motion, then convert to wheel rotation.
+        world-space motion, then convert to wheel "turns".
 
-        This covers the common case where the path/constraint is on the
-        armature object instead of a specific root bone.
+        The custom property will hold "number of rotations"; wheel drivers
+        typically multiply by 2π to get radians.
         """
         scene = context.scene
         obj = context.object
         depsgraph = context.evaluated_depsgraph_get()
 
-        # Wheel radius from the wheel MCH bone length
+        # Wheel radius from the wheel MCH bone length (length = diameter)
         radius = bone.length * 0.5 if bone.length > 0.0 else 1.0
 
         # Assume car forward is +Y in object local space
@@ -331,13 +322,12 @@ class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
 
             return pos, rot_q, brake_y
 
-        # Initial state
         prev_pos, prev_rot_q, prev_brake_y = sample(self.frame_start)
-        distance = 0.0
-        prev_speed = 0.0
+        distance_turns = 0.0
+        prev_speed_turns = 0.0
 
-        # Always put a key on the first frame
-        yield self.frame_start, distance
+        # Always key the first frame
+        yield self.frame_start, distance_turns
 
         for f in range(self.frame_start + 1, self.frame_end + 1):
             pos, rot_q, brake_y = sample(f)
@@ -345,7 +335,7 @@ class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
             # Linear displacement this frame
             speed_vec = pos - prev_pos
 
-            # Apply brake factor as original (2 * scale_y - 1)
+            # Apply brake factor as original logic (2 * scale_y - 1)
             speed_vec *= (2.0 * brake_y - 1.0)
 
             # Signed speed along car forward direction
@@ -354,32 +344,34 @@ class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
             if speed != 0.0:
                 speed = math.copysign(speed, forward_world.dot(speed_vec))
 
-            # Convert linear distance to wheel angle (radians)
-            angular_speed = -speed / (2.0 * math.pi * radius)
+            # Convert linear distance to wheel turns:
+            # turns = distance / (2πr)
+            speed_turns = 0.0
+            if radius > 0.0:
+                speed_turns = -speed / (2.0 * math.pi * radius)
 
             drop_keyframe = False
-            if angular_speed == 0.0:
-                drop_keyframe = (prev_speed == angular_speed)
-            elif prev_speed != 0.0:
-                drop_keyframe = abs(1.0 - prev_speed / angular_speed) < self.keyframe_tolerance / 10.0
+            if speed_turns == 0.0:
+                drop_keyframe = (prev_speed_turns == speed_turns)
+            elif prev_speed_turns != 0.0:
+                drop_keyframe = abs(1.0 - (prev_speed_turns / speed_turns)) < (self.keyframe_tolerance / 10.0)
 
             if not drop_keyframe:
-                prev_speed = angular_speed
-                # Key on previous frame (matches original logic)
-                yield f - 1, distance
+                prev_speed_turns = speed_turns
+                # Match original behaviour: key one frame earlier
+                yield f - 1, distance_turns
 
-            distance += angular_speed
+            distance_turns += speed_turns
             prev_pos = pos
 
-        # Final frame
-        yield self.frame_end, distance
+        # Final safety key
+        yield self.frame_end, distance_turns
 
     def _bake_wheel_rotation(self, context, bone, brake_bone):
         """
         Create/update the custom property FCurve on the original action,
         based on evaluated rig motion.
         """
-        # Ensure FCurve exists for this wheel property
         prop_name = bone.name.replace('MCH-', '')
         fc_rot = create_property_animation(context, prop_name)
         if fc_rot is None:
@@ -389,16 +381,17 @@ class ANIM_OT_carWheelsRotationBake(bpy.types.Operator, BakingOperator):
         pb: bpy.types.PoseBone = context.object.pose.bones[bone.name]
         pb.matrix_basis.identity()
 
-        # Evaluate distance (integrated angle) and key it
-        for f, distance in self._evaluate_distance_per_frame(context, bone, brake_bone):
-            kf = fc_rot.keyframe_points.insert(f, distance)
+        # Evaluate number of wheel turns and key it
+        for f, distance_turns in self._evaluate_distance_per_frame(context, bone, brake_bone):
+            kf = fc_rot.keyframe_points.insert(f, distance_turns)
             kf.interpolation = 'LINEAR'
-            kf.type = 'JITTER'
+            kf.type = 'KEYFRAME'
 
 
 # ------------------------------------------------------------------------
 #  Steering bake operator
 # ------------------------------------------------------------------------
+
 
 class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
     bl_idname = 'anim.car_steering_bake'
@@ -408,7 +401,7 @@ class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
 
     rotation_factor: bpy.props.FloatProperty(
         name='Rotation factor',
-        min=.1,
+        min=0.1,
         default=1.0
     )
 
@@ -429,6 +422,8 @@ class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
                 bone_offset = abs(steering.head_local.y - mch_steering_rotation.head_local.y)
                 self._bake_steering_rotation(context, bone_offset, mch_steering_rotation)
         return {'FINISHED'}
+
+    # --- steering helpers ---
 
     def _wrap_angle(self, angle: float) -> float:
         """Wrap angle to [-pi, pi] for stable heading deltas."""
@@ -469,7 +464,6 @@ class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
             headings[f] = heading_at(f)
 
         # Scale to make values "angle-like" without needing to type 180 in UI
-        # (delta_heading is in radians, so * (180/pi) ≈ degrees of turn-rate)
         radians_to_degrees = 180.0 / math.pi
 
         for f in range(self.frame_start, self.frame_end):
@@ -477,7 +471,7 @@ class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
             h_next = headings.get(f + 1, headings[f])
 
             # Central difference: approximate d(theta)/df
-            delta_heading = self._wrap_angle(h_next - h_prev) * 0.25 #arbitrary factor for smoother results
+            delta_heading = self._wrap_angle(h_next - h_prev) * 0.25 #arbitrary 0.25 factor for smoother response
 
             # Steering proportional to turn-rate, scaled into degree-like units.
             # Flip the sign if your rig steers the opposite way.
@@ -507,6 +501,7 @@ class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
 # ------------------------------------------------------------------------
 #  Clear baked animation operator
 # ------------------------------------------------------------------------
+
 
 class ANIM_OT_carClearSteeringWheelsRotation(bpy.types.Operator):
     bl_idname = "anim.car_clear_steering_wheels_rotation"
@@ -557,6 +552,7 @@ class ANIM_OT_carClearSteeringWheelsRotation(bpy.types.Operator):
 # ------------------------------------------------------------------------
 #  Registration
 # ------------------------------------------------------------------------
+
 
 def register():
     bpy.utils.register_class(ANIM_OT_carWheelsRotationBake)
