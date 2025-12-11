@@ -430,55 +430,58 @@ class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
                 self._bake_steering_rotation(context, bone_offset, mch_steering_rotation)
         return {'FINISHED'}
 
-    def _wrap_angle(self, angle):
-        """Wrap angle to [-pi, pi] for stable deltas."""
+    def _wrap_angle(self, angle: float) -> float:
+        """Wrap angle to [-pi, pi] for stable heading deltas."""
         while angle > math.pi:
             angle -= 2.0 * math.pi
         while angle < -math.pi:
             angle += 2.0 * math.pi
         return angle
 
-    def _evaluate_rotation_per_frame(self, context, bone_offset, bone):
+    def _evaluate_rotation_per_frame(self, context, action, bone_offset, bone):
         """
-        Compute steering per frame based on the *rate of change* of the
-        armature object's heading, and output a value for EVERY frame.
+        Compute steering as the *rate of change* of the car heading, evaluated
+        from the armature object's world transform.
 
-        This:
-        - goes back to ~0 on straight sections (heading stops changing),
-        - is smooth (we use central differences, no keyframe decimation),
-        - lets the FCurve interpolation handle the 'lerp' between directions.
+        - On straight sections (heading constant) → steering ~ 0
+        - When turning → steering has a non-zero value
+        - We output a value for *every* frame for smooth interpolation.
         """
         scene = context.scene
         obj = context.object
         depsgraph = context.evaluated_depsgraph_get()
 
-        # Car forward axis in object local space
+        # Car forward axis in object local space (+Y is forward for the rig)
         forward_local = mathutils.Vector((0.0, 1.0, 0.0))
 
-        def heading_at(frame):
+        def heading_at(frame: int) -> float:
+            """Heading of the car in the ground plane (X–Y) at given frame."""
             scene.frame_set(frame)
             eval_obj = obj.evaluated_get(depsgraph)
             mat_obj = eval_obj.matrix_world
             forward_world = mat_obj.to_quaternion() @ forward_local
-            # Heading in ground plane (X–Y)
+            # Heading angle in ground plane
             return math.atan2(forward_world.x, forward_world.y)
 
-        # Pre-sample headings for a small neighborhood around the range
+        # Pre-sample headings so we can do a central difference
         headings = {}
         for f in range(self.frame_start - 1, self.frame_end + 2):
             headings[f] = heading_at(f)
 
-        # Central difference per-frame heading change
+        # Scale to make values "angle-like" without needing to type 180 in UI
+        # (delta_heading is in radians, so * (180/pi) ≈ degrees of turn-rate)
+        radians_to_degrees = 180.0 / math.pi
+
         for f in range(self.frame_start, self.frame_end):
             h_prev = headings.get(f - 1, headings[f])
             h_next = headings.get(f + 1, headings[f])
 
-            # Central difference (note the 0.5 factor)
-            delta_heading = self._wrap_angle(h_next - h_prev) * 0.5
+            # Central difference: approximate d(theta)/df
+            delta_heading = self._wrap_angle(h_next - h_prev) * 0.25 #arbitrary factor for smoother results
 
-            # Steering proportional to turning rate.
-            # Flip the sign if the direction is reversed in your rig.
-            steering_position = -delta_heading * self.rotation_factor * 180
+            # Steering proportional to turn-rate, scaled into degree-like units.
+            # Flip the sign if your rig steers the opposite way.
+            steering_position = -delta_heading * radians_to_degrees * self.rotation_factor
 
             yield f, steering_position
 
@@ -495,7 +498,7 @@ class ANIM_OT_carSteeringBake(bpy.types.Operator, BakingOperator):
         pb.matrix_basis.identity()
 
         # Evaluate steering directly from evaluated rig
-        for f, steering_pos in self._evaluate_rotation_per_frame(context, bone_offset, bone):
+        for f, steering_pos in self._evaluate_rotation_per_frame(context, None, bone_offset, bone):
             kf = fc_rot.keyframe_points.insert(f, steering_pos)
             kf.type = 'KEYFRAME'
             kf.interpolation = 'BEZIER'
