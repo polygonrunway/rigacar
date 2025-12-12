@@ -61,6 +61,12 @@ def _get_channelbag(action, anim_data=None, ensure=False):
 
     slot = _get_action_slot(anim_data)
 
+    if slot is None and ensure:
+        slot = _ensure_action_slot(action, anim_data)
+
+    if slot is None:
+        return None
+
     try:
         if ensure and hasattr(bpy_extras.anim_utils, "action_ensure_channelbag_for_slot"):
             return bpy_extras.anim_utils.action_ensure_channelbag_for_slot(action, slot)
@@ -71,6 +77,70 @@ def _get_channelbag(action, anim_data=None, ensure=False):
 
     return None
 
+def _ensure_action_slot(action, anim_data):
+    """
+    Blender 5: ensure an Action Slot exists and is active on the anim_data.
+    Returns the slot or None.
+    """
+    action = _unwrap_action(action)
+    if action is None or anim_data is None:
+        return None
+
+    # If anim_data already has a slot, we're done.
+    slot = _get_action_slot(anim_data)
+    if slot is not None:
+        return slot
+
+    # If the Action already has slots, just pick the first one and assign it.
+    slots = getattr(action, "slots", None)
+    if slots is not None:
+        try:
+            if len(slots) > 0:
+                slot0 = slots[0]
+                try:
+                    anim_data.action_slot = slot0
+                except Exception:
+                    pass
+                return slot0
+        except Exception:
+            pass
+
+    # Otherwise, create a slot with the correct signature: new(id_type=..., name=...)
+    id_type = "OBJECT"
+    try:
+        # anim_data.id_data should be the datablock that owns this AnimData (usually the Object)
+        owner = getattr(anim_data, "id_data", None)
+        if owner is not None:
+            id_type = getattr(owner, "id_type", None) or getattr(owner, "rna_type", None) and owner.rna_type.identifier
+            # Most robust fallback:
+            if isinstance(id_type, str) is False:
+                id_type = "OBJECT"
+    except Exception:
+        id_type = "OBJECT"
+
+    if slots is not None and hasattr(slots, "new"):
+        try:
+            slot = slots.new(id_type=id_type, name="Rigacar")
+        except TypeError:
+            # Some builds might not support keyword args
+            slot = slots.new(id_type, "Rigacar")
+        except Exception:
+            slot = None
+
+        if slot is not None:
+            try:
+                anim_data.action_slot = slot
+            except Exception:
+                pass
+            try:
+                # Some builds expose an active slot on the action's slots collection
+                if hasattr(slots, "active"):
+                    slots.active = slot
+            except Exception:
+                pass
+            return slot
+
+    return None
 
 def _get_fcurves_container(action, anim_data=None, ensure=False):
     """
@@ -173,8 +243,15 @@ def create_property_animation(context, property_name):
 
     # --- Blender 5: ALWAYS go through channelbags ---
     channelbag = _get_channelbag(action, anim_data=anim_data, ensure=True)
+
+    # Blender 5 edge case: action exists but has no active slot yet
     if channelbag is None:
-        raise RuntimeError("Failed to acquire ChannelBag for action")
+        # Force-create an action slot by reassigning the action
+        anim_data.action = action
+        channelbag = _get_channelbag(action, anim_data=anim_data, ensure=True)
+
+    if channelbag is None:
+        raise RuntimeError("Failed to acquire ChannelBag for action (no active slot)")
 
     fcurves = channelbag.fcurves
     fcurve_datapath = '["%s"]' % property_name
